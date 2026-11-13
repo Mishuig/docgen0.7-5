@@ -1,0 +1,156 @@
+name: Build portable Windows app
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: portable-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  PublishReadyToRun: false
+
+jobs:
+  build:
+    name: win-x64 portable
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 9
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Pin SDK 9 (ignore host SDK 10)
+        shell: pwsh
+        run: |
+          $line = dotnet --list-sdks |
+            Where-Object { $_ -match '^9\.' } |
+            Select-Object -Last 1
+          if (-not $line) { throw 'No .NET 9 SDK installed on runner' }
+          if ($line -notmatch '^(?<ver>\d+\.\d+\.\d+)') { throw "Cannot parse SDK: $line" }
+          $ver = $Matches['ver']
+          @{
+            sdk = @{
+              version = $ver
+              rollForward = 'latestFeature'
+            }
+          } | ConvertTo-Json | Set-Content -Path global.json -Encoding utf8
+          Write-Host "global.json -> SDK $ver"
+          Get-Content global.json
+          dotnet --version
+
+      - name: Read version
+        id: meta
+        shell: pwsh
+        run: |
+          $xml = [xml](Get-Content -Raw .\DocumentGenerator.csproj)
+          $version = @(
+            $xml.Project.PropertyGroup |
+              ForEach-Object { $_.Version } |
+              Where-Object { $_ }
+          ) | Select-Object -First 1
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            throw 'Version not found in DocumentGenerator.csproj'
+          }
+          $name = "Docugen-$version-portable-win-x64"
+          "version=$version" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "artifact=$name" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "version=$version artifact=$name"
+
+      - name: Restore
+        shell: pwsh
+        run: |
+          dotnet restore .\DocumentGenerator.csproj `
+            --runtime win-x64 `
+            -p:PublishReadyToRun=false `
+            -p:PublishSingleFile=false
+          if ($LASTEXITCODE -ne 0) { throw "restore failed ($LASTEXITCODE)" }
+
+      - name: Publish
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $name = '${{ steps.meta.outputs.artifact }}'
+          $out  = Join-Path $env:GITHUB_WORKSPACE 'publish' $name
+
+          if (Test-Path $out) { Remove-Item $out -Recurse -Force }
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+
+          Write-Host "Output: $out"
+          Write-Host "dotnet: $(dotnet --version)"
+
+          dotnet publish .\DocumentGenerator.csproj `
+            --configuration Release `
+            --runtime win-x64 `
+            --self-contained true `
+            --no-restore `
+            -p:PublishReadyToRun=false `
+            -p:PublishSingleFile=false `
+            -p:DebugType=None `
+            -p:DebugSymbols=false `
+            --output $out
+
+          if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed ($LASTEXITCODE)" }
+
+          $exe = Join-Path $out 'DocumentGenerator.exe'
+          if (-not (Test-Path -LiteralPath $exe)) { throw "Missing DocumentGenerator.exe" }
+
+          $sqlite = Get-ChildItem -Path $out -Filter 'e_sqlite3.dll' -Recurse -EA SilentlyContinue |
+                    Select-Object -First 1
+          if (-not $sqlite) { throw 'Missing e_sqlite3.dll' }
+
+          $files = Get-ChildItem -Path $out -File -Recurse
+          $mb = [math]::Round((($files | Measure-Object Length -Sum).Sum) / 1MB, 1)
+          Write-Host ("OK: {0} files, {1} MB" -f $files.Count, $mb)
+
+          foreach ($pair in @{
+            'README.md'='README.txt'; 'App.ico'='App.ico'
+            'Start-Docugen.cmd'='Start-Docugen.cmd'
+            'Create-Shortcut.cmd'='Create-Shortcut.cmd'
+            'create-shortcut.ps1'='create-shortcut.ps1'
+          }.GetEnumerator()) {
+            if (Test-Path $pair.Key) {
+              Copy-Item $pair.Key (Join-Path $out $pair.Value) -Force
+            }
+          }
+          if (Test-Path samples) {
+            Copy-Item samples (Join-Path $out 'samples') -Recurse -Force
+          }
+
+          $zip = Join-Path $env:GITHUB_WORKSPACE 'publish' "$name.zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Compress-Archive -Path (Join-Path $out '*') -DestinationPath $zip -Force
+
+          "ZIP_PATH=$zip" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "ZIP_NAME=$name" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_PATH }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" "$env:ZIP_PATH" `
+            --title "Docugen ${{ steps.meta.outputs.version }}" `
+            --generate-notes --clobber
